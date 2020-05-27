@@ -1,0 +1,6 @@
+# Security
+.envrc
+*.pem
+
+# Emacs
+*~

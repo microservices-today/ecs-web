@@ -1,0 +1,395 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  Tag:
+    Type: String
+    Description: Tag of the Docker Image.
+    Default: IMAGE_TAG
+  EnvironmentName:
+    Type: String
+    Description: Name of the Environment.
+    Default: ENVIRONMENT_NAME
+  ServiceMaxCapacity:
+    Description: 'The maximum number of simultaneous tasks, that you want to run on the cluster.'
+    Type: Number
+    Default: 5
+    ConstraintDescription: 'Must be >= 1'
+    MinValue: 1
+  ServiceMinCapacity:
+    Description: 'The minimum number of simultaneous tasks, that you want to run on the cluster.'
+    Type: Number
+    Default: 2
+    ConstraintDescription: 'Must be >= 1'
+    MinValue: 1
+  Email:
+    Type: String
+    Description: Email address to notify when an API activity has triggered an alarm
+    Default: EMAIL
+  ECSRespositoryName:
+    Type: String
+    Description: 'ECS Repository Name'
+    Default: ECS_REPOSITORY_NAME
+
+Conditions:
+  IsApiGatewayNeeded: !Not [ !Equals [ 'S3_SWAGGER_BUCKET_NAME', 'SKIP_API_GATEWAY' ] ]
+
+Resources:
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      #The Family name will be used along with ECS_CLUSTER_NAME to prepare the stack name. It should be of Format abb-cdd-sd
+      Family: APP_NAME-BUILD_SCOPE
+      ContainerDefinitions:
+      - Name: APP_NAME
+        Cpu: ECS_CPU_COUNT
+        Essential: 'true'
+        Image:
+          "Fn::Sub":
+            - '${AccountId}.dkr.ecr.${Region}.amazonaws.com/${ECSRespositoryName}:TAG'
+            - { AccountId: { "Ref" : "AWS::AccountId" }, Region: { "Ref" : "AWS::Region" }}
+        MemoryReservation: ECS_MEMORY_RESERVATION_COUNT
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group:
+              Ref: ContainerLogGroup
+            awslogs-region:
+              Ref: AWS::Region
+        PortMappings:
+        - ContainerPort: 9000
+          HostPort: 0
+        ENVIRONMENT_VARIABLES
+  ECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Security Group
+      VpcId:
+        Fn::ImportValue:
+           Fn::Sub:  "${EnvironmentName}-VPC"
+      SecurityGroupIngress:
+        # Only allow inbound access to ECS from the same VPC
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: 0.0.0.0/0
+  ContainerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${EnvironmentName}-APP_NAME"
+      RetentionInDays: 14
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Sub: "ECSLogGroup-${AWS::StackName}"
+      RetentionInDays: 14
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-APP_NAME"
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '30'
+      Subnets:
+        - Fn::ImportValue:
+            Fn::Sub: "${EnvironmentName}-PublicSubnet1"
+        - Fn::ImportValue:
+            Fn::Sub: "${EnvironmentName}-PublicSubnet2"
+      SecurityGroups:
+      - Ref: ECSSecurityGroup
+      - Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-ECSHostSecurityGroup"
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: ECSServiceRole
+    Properties:
+      Certificates:
+      - CertificateArn: CERTIFICATE_ARN
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: ECSTG
+      LoadBalancerArn:
+        Ref: ALB
+      Port: '443'
+      Protocol: HTTPS
+  ECSTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: ALB
+    Properties:
+      Name: !Sub "${EnvironmentName}-APP_NAME"
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId:
+        Fn::ImportValue:
+           Fn::Sub: "${EnvironmentName}-VPC"
+  Route53:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: HOSTED_ZONE
+      Comment: APP_NAME target
+      RecordSets:
+      - Name: APP_NAME.HOSTED_ZONE
+        Type: A
+        AliasTarget:
+          HostedZoneId: !GetAtt ALB.CanonicalHostedZoneID
+          DNSName: !GetAtt ALB.DNSName
+  ECSServicePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: "ecs-service"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: ['*']
+            Resource: '*'
+      Roles:
+      - Ref: ECSServiceRole
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ECSServicePolicy
+      - ALB
+      - ALBListener
+    Properties:
+      Cluster:
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-ECSCluster"
+      DesiredCount: DESIRED_COUNT
+      TaskDefinition:
+        Ref: TaskDefinition
+      LoadBalancers:
+      - ContainerName: APP_NAME
+        ContainerPort: 9000
+        TargetGroupArn:
+          Ref: ECSTG
+      Role:
+        Ref: ECSServiceRole
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Condition: IsApiGatewayNeeded
+    Properties:
+      Name: GITHUB_REPO
+      Body:
+OPEN_API_SPEC
+  ScalableTargetRole: # based on http://docs.aws.amazon.com/AmazonECS/latest/developerguide/autoscale_IAM_role.html
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'application-autoscaling.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+      - PolicyName: ecs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'ecs:DescribeServices'
+            - 'ecs:UpdateService'
+            Resource: '*'
+      - PolicyName: cloudwatch
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'cloudwatch:DescribeAlarms'
+            Resource: '*'
+  ScalableTarget:
+    Type: 'AWS::ApplicationAutoScaling::ScalableTarget'
+    Properties:
+      MaxCapacity: !Ref ServiceMaxCapacity
+      MinCapacity: !Ref ServiceMinCapacity
+      ResourceId: !Sub
+        - 'service/${Cluster}/${Service}'
+        - Cluster:
+            'Fn::ImportValue': !Sub '${EnvironmentName}-ECSCluster'
+          Service: !GetAtt 'Service.Name'
+      RoleARN: !GetAtt 'ScalableTargetRole.Arn'
+      ScalableDimension: 'ecs:service:DesiredCount'
+      ServiceNamespace: ecs
+  ScaleUpPolicy:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-scale-up'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: PercentChangeInCapacity
+        Cooldown: 300
+        MinAdjustmentMagnitude: 1
+        StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          ScalingAdjustment: 25
+  ScaleDownPolicy:
+    Type: 'AWS::ApplicationAutoScaling::ScalingPolicy'
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-scale-down'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: PercentChangeInCapacity
+        Cooldown: 300
+        MinAdjustmentMagnitude: 1
+        StepAdjustments:
+        - MetricIntervalUpperBound: 0
+          ScalingAdjustment: -25
+  CPUUtilizationHighAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Service is running out of CPU'
+      Namespace: 'AWS/ECS'
+      Dimensions:
+      - Name: ClusterName
+        Value:
+          Fn::ImportValue: !Sub '${EnvironmentName}-ECSCluster'
+      - Name: ServiceName
+        Value: !GetAtt 'Service.Name'
+      MetricName: CPUUtilization
+      ComparisonOperator: GreaterThanThreshold
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 80
+      AlarmActions:
+      - !Ref ScaleUpPolicy
+  CPUUtilizationLowAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Service is wasting CPU'
+      Namespace: 'AWS/ECS'
+      Dimensions:
+      - Name: ClusterName
+        Value:
+          Fn::ImportValue: !Sub '${EnvironmentName}-ECSCluster'
+      - Name: ServiceName
+        Value: !GetAtt 'Service.Name'
+      MetricName: CPUUtilization
+      ComparisonOperator: LessThanThreshold
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 20
+      AlarmActions:
+      - !Ref ScaleDownPolicy
+  MemoryUtilizationHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 'Service is running out of memory'
+      Namespace: AWS/ECS
+      Dimensions:
+      - Name: ClusterName
+        Value:
+          Fn::ImportValue: !Sub '${EnvironmentName}-ECSCluster'
+      - Name: ServiceName
+        Value: !GetAtt 'Service.Name'
+      MetricName: MemoryUtilization
+      ComparisonOperator: GreaterThanThreshold
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 80
+      AlarmActions:
+      - !Ref ScaleUpPolicy
+  MemoryUtilizationLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: 'Service is wasting memory'
+      Namespace: AWS/ECS
+      Dimensions:
+      - Name: ClusterName
+        Value:
+          Fn::ImportValue: !Sub '${EnvironmentName}-ECSCluster'
+      - Name: ServiceName
+        Value: !GetAtt 'Service.Name'
+      MetricName: MemoryUtilization
+      ComparisonOperator: LessThanThreshold
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 20
+      AlarmActions:
+      - !Ref ScaleDownPolicy
+  HealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'ECS APP_NAME - Healthy Hosts ${EnvironmentName}'
+      EvaluationPeriods: 5
+      Statistic: Maximum
+      Threshold: '1'
+      AlarmDescription: Alarm if the number of healthy hosts is less than or equal to 1.
+      Period: '300'
+      AlarmActions:
+      - Ref: "AlarmNotificationTopic"
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+      - Name: LoadBalancer
+        Value:
+          "Fn::GetAtt": [ ALB, LoadBalancerFullName ]
+      - Name: TargetGroup
+        Value:
+          "Fn::GetAtt": [ ECSTG, TargetGroupFullName ]
+      ComparisonOperator: LessThanThreshold
+      MetricName: HealthyHostCount
+  UnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'ECS APP_NAME - Unhealthy Hosts ${EnvironmentName}'
+      EvaluationPeriods: 5
+      Statistic: Maximum
+      Threshold: '1'
+      AlarmDescription: Alarm if the number of unhealthy hosts is greater than or equal to 1.
+      Period: '300'
+      AlarmActions:
+      - Ref: "AlarmNotificationTopic"
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+      - Name: LoadBalancer
+        Value:
+          "Fn::GetAtt": [ ALB, LoadBalancerFullName ]
+      - Name: TargetGroup
+        Value:
+          "Fn::GetAtt": [ ECSTG, TargetGroupFullName ]
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      MetricName: UnHealthyHostCount
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'APP_NAME-topic-${EnvironmentName}'
+  AlarmNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: EMAIL
+      Protocol: email
+      TopicArn:
+        Ref: AlarmNotificationTopic
+Outputs:
+  ecsservice:
+    Value:
+      Ref: Service
+  AppALBDNS:
+    Value:
+      "Fn::GetAtt": [ ALB, DNSName ]
